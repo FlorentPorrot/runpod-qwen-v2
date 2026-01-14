@@ -1,0 +1,11 @@
+FROM python:3.10-slim AS builder
+
+# # Installer huggingface_hub et s'assurer que le CLI est disponible
+RUN pip install --no-cache-dir huggingface_hub
+
+# # # Télécharger le modèle
+ENV HF_HOME=/models
+RUN hf download nunchaku-tech/nunchaku-qwen-image-edit-2509 svdq-int4_r32-qwen-image-edit-2509-lightningv2.0-4steps.safetensors
+
+# QWEN sera mis en cache RUNPOD
+# RUN hf download Qwen/Qwen-Image-Edit-2509
