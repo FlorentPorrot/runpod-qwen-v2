@@ -65,11 +65,12 @@ def load_model_qwen():
     )
     model_path_qwen = "Qwen/Qwen-Image-Edit-2509"
 
-    log(f"Load transformer: {model_path_nunchaku}")
+log(f"Load transformer: {model_path_nunchaku}")
+    # FORCE .to(torch.float16) here to fix the "Half vs BFloat16" crash
     transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(
         model_path_nunchaku, 
         local_files_only=True
-    )
+    ).to(dtype=torch.float16)
 
     log(f"Load pipeline: {model_path_qwen}")
     # --- FIX 2: Do not call .to("cuda") here. Let offload handle it. ---
