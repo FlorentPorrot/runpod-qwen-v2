@@ -1,39 +1,33 @@
 import runpod
-
 import math
 import base64
 import io
 import sys
 import gc
+import os
+
+# --- IMPROVEMENT 1: Fix Memory Fragmentation ---
+# This helps when VRAM is nearly full (like your 23.56/23.57 GiB case)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import traceback
-
 from PIL import Image
-
 from nunchaku import NunchakuQwenImageTransformer2DModel
 from nunchaku.utils import get_gpu_memory
-
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
 
-
-# -----------------------------
-# Config (v2)
-# -----------------------------
-# Guardrail to avoid rare killer requests (adjust if you need bigger)
-MAX_PIXELS = 1024 * 1024  # 1024x1024
-# Optional guardrail for very large base64 payloads (string length)
-MAX_B64_LEN = 15_000_000
-
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+MAX_PIXELS = 1024 * 1024  # 1MP limit
+MAX_B64_LEN = 15_000_000  # ~15MB base64 limit
 
 def log(msg: str):
     print(msg)
     sys.stdout.flush()
 
-
 def cleanup_on_cuda_error(e: Exception):
-    """
-    Only clean up on CUDA-ish failures to avoid slowing down normal requests.
-    """
     msg = str(e).lower()
     if ("cuda" in msg) or ("out of memory" in msg) or ("cublas" in msg):
         log("CUDA-related error detected -> running gc + empty_cache()")
@@ -43,20 +37,19 @@ def cleanup_on_cuda_error(e: Exception):
         except Exception:
             pass
 
-
-# -----------------------------------------------
-# -- Load Model Qwen (v2)
-# -----------------------------------------------
+# ----------------------------------------------------------------------------
+# Load Model (Fixed for 4090 OOM)
+# ----------------------------------------------------------------------------
 def load_model_qwen():
     scheduler_config = {
         "base_image_seq_len": 256,
-        "base_shift": math.log(3),  # We use shift=3 in distillation
+        "base_shift": math.log(3),
         "invert_sigmas": False,
         "max_image_seq_len": 8192,
-        "max_shift": math.log(3),  # We use shift=3 in distillation
+        "max_shift": math.log(3),
         "num_train_timesteps": 1000,
         "shift": 1.0,
-        "shift_terminal": None,  # set shift_terminal to None
+        "shift_terminal": None,
         "stochastic_sampling": False,
         "time_shift_type": "exponential",
         "use_beta_sigmas": False,
@@ -66,80 +59,65 @@ def load_model_qwen():
     }
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
 
-    model_path_nunchaku_transformer_safetensor_file = (
+    model_path_nunchaku = (
         "nunchaku-tech/nunchaku-qwen-image-edit-2509/"
         "svdq-int4_r32-qwen-image-edit-2509-lightningv2.0-4steps.safetensors"
     )
     model_path_qwen = "Qwen/Qwen-Image-Edit-2509"
 
-    log(f"Load transformer : {model_path_nunchaku_transformer_safetensor_file}")
+    log(f"Load transformer: {model_path_nunchaku}")
     transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(
-        model_path_nunchaku_transformer_safetensor_file,
-        local_files_only=True,
+        model_path_nunchaku, 
+        local_files_only=True
     )
 
-    # Load the model pipeline Qwen
-    log(f"Load pipeline : {model_path_qwen}")
+    log(f"Load pipeline: {model_path_qwen}")
+    # --- FIX 2: Do not call .to("cuda") here. Let offload handle it. ---
     pipeline = QwenImageEditPlusPipeline.from_pretrained(
         model_path_qwen,
         transformer=transformer,
         scheduler=scheduler,
-        torch_dtype=torch.float16,  # ✅ v2: force FP16 (avoid BF16 cuBLAS issues)
+        torch_dtype=torch.float16,  # Keep FP16 to avoid cuBLAS error
         local_files_only=False,
     )
 
-    # Put pipeline on GPU if available (safe even if CPU offload is used later)
-    if torch.cuda.is_available():
-        pipeline = pipeline.to("cuda")
-
-    # ✅ v2: Do NOT enable CPU offload on 24GB GPUs (4090/L4).
-    # Only use offloading for genuinely low VRAM GPUs.
+    # --- FIX 3: Restore logic to offload on 4090 (High VRAM) ---
     vram_gb = get_gpu_memory()
     log(f"Detected VRAM: {vram_gb:.1f} GB")
 
     if vram_gb <= 18:
+        # L4 logic (Low VRAM)
         log("Low VRAM mode: enabling sequential CPU offload")
         transformer.set_offload(True, use_pin_memory=False, num_blocks_on_gpu=1)
         pipeline._exclude_from_cpu_offload.append("transformer")
         pipeline.enable_sequential_cpu_offload()
     else:
-        log("High VRAM mode: keep model on GPU (no CPU offload)")
+        # 4090 logic (High VRAM)
+        # We MUST use model_cpu_offload because Qwen is larger than 24GB in operation
+        log("High VRAM mode: enabling model CPU offload")
+        pipeline.enable_model_cpu_offload()
 
     return pipeline
 
-
-# -----------------------------------------------
-# -- Inference helpers
-# -----------------------------------------------
-def generate_image(
-    pipeline,
-    input_image,
-    input_jersey,
-    input_prompt: str,
-    input_negative_prompt: str,
-    input_width: int,
-    input_height: int,
-    input_cfg_scale: float,
-):
+# ----------------------------------------------------------------------------
+# Inference Helpers
+# ----------------------------------------------------------------------------
+def generate_image(pipeline, input_image, input_jersey, prompt, negative_prompt, width, height, cfg):
     inputs = {
         "image": [input_image, input_jersey],
-        "prompt": input_prompt,
-        "negative_prompt": input_negative_prompt,
-        "width": input_width,
-        "height": input_height,
-        "true_cfg_scale": input_cfg_scale,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "width": width,
+        "height": height,
+        "true_cfg_scale": cfg,
         "num_inference_steps": 4,
     }
-
     return pipeline(**inputs).images[0]
 
-
-def convert_image_to_base64(input_image: Image.Image) -> str:
+def convert_image_to_base64(img: Image.Image) -> str:
     buffered = io.BytesIO()
-    input_image.save(buffered, format="PNG")
-    img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return img_base64
-
+    img.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 def decode_b64_image(b64_str: str) -> Image.Image:
     if len(b64_str) > MAX_B64_LEN:
@@ -147,86 +125,81 @@ def decode_b64_image(b64_str: str) -> Image.Image:
     image_bytes = base64.b64decode(b64_str)
     return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
+# ----------------------------------------------------------------------------
+# Init
+# ----------------------------------------------------------------------------
+log("BOOT: starting rp_handler_v2")
+try:
+    pipeline = load_model_qwen()
+    log("BOOT: Model loaded successfully")
+except Exception as e:
+    log(f"BOOT CRASH: {e}")
+    traceback.print_exc()
+    sys.stdout.flush()
+    sys.exit(1)
 
-# -----------------------------------------------
-# -- Initialize model (global, once per worker)
-# -----------------------------------------------
-pipeline = load_model_qwen()
-
-
-# -----------------------------------------------
-# -- Handler
-# -----------------------------------------------
+# ----------------------------------------------------------------------------
+# Handler
+# ----------------------------------------------------------------------------
 def handler(event):
     if "input" not in event:
         return {"error": "Payload must contain 'input' key"}
-
+        
     input_data = event.get("input", {})
 
-    # Selfie
-    if "image_base64" in input_data:
-        try:
+    # Decode Images
+    try:
+        if "image_base64" in input_data:
             image = decode_b64_image(input_data["image_base64"])
-        except Exception as e:
-            return {"error": f"Invalid base64 image: {str(e)}"}
-    elif "image_path" in input_data:
-        try:
+        elif "image_path" in input_data:
             image = Image.open(input_data["image_path"]).convert("RGB")
-        except Exception as e:
-            return {"error": f"Cannot open image at path: {str(e)}"}
-    else:
-        return {"error": "No image provided. Use 'image_base64' or 'image_path'."}
+        else:
+            return {"error": "No image provided. Use 'image_base64' or 'image_path'."}
 
-    # Jersey
-    if "jersey_base64" in input_data:
-        try:
+        if "jersey_base64" in input_data:
             jersey = decode_b64_image(input_data["jersey_base64"])
-        except Exception as e:
-            return {"error": f"Invalid base64 jersey image: {str(e)}"}
-    elif "jersey_path" in input_data:
-        try:
+        elif "jersey_path" in input_data:
             jersey = Image.open(input_data["jersey_path"]).convert("RGB")
-        except Exception as e:
-            return {"error": f"Cannot open jersey image at path: {str(e)}"}
-    else:
-        return {"error": "No jersey image provided. Use 'jersey_base64' or 'jersey_path'."}
+        else:
+            return {"error": "No jersey image provided. Use 'jersey_base64' or 'jersey_path'."}
+            
+    except Exception as e:
+         return {"error": f"Image decode error: {str(e)}"}
 
     prompt = input_data.get("prompt")
-    if prompt is None:
+    if not prompt:
         return {"error": "Missing Prompt into input"}
-
+        
     negative_prompt = input_data.get("negative_prompt", "")
     width = int(input_data.get("width", 1024))
     height = int(input_data.get("height", 1024))
     true_cfg_scale = float(input_data.get("true_cfg_scale", 1.0))
 
-    # Guardrail for OOM spikes (v2)
+    # Guardrails
     if width <= 0 or height <= 0:
         return {"error": "Invalid width/height"}
     if width * height > MAX_PIXELS:
         return {"error": f"Resolution too large: {width}x{height}"}
 
     try:
-        image_generated = generate_image(
+        log(f"Request: {width}x{height} cfg={true_cfg_scale}")
+        out_img = generate_image(
             pipeline=pipeline,
             input_image=image,
             input_jersey=jersey,
-            input_prompt=prompt,
-            input_negative_prompt=negative_prompt,
-            input_width=width,
-            input_height=height,
-            input_cfg_scale=true_cfg_scale,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            cfg=true_cfg_scale,
         )
-
-        img_base64 = convert_image_to_base64(input_image=image_generated)
-        return {"image_base64": img_base64}
-
+        return {"image_base64": convert_image_to_base64(out_img)}
+        
     except Exception as e:
         cleanup_on_cuda_error(e)
         tb = traceback.format_exc()
         log(tb)
-        return {"error": f"error creating image: {str(e)}", "trace": tb[:1500]}
-
+        return {"error": f"Error creating image: {str(e)}", "trace": tb[:1500]}
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
