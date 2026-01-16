@@ -7,7 +7,6 @@ import gc
 import os
 
 # --- IMPROVEMENT 1: Fix Memory Fragmentation ---
-# Using the updated env var name as per the warning in your logs
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import traceback
@@ -38,7 +37,7 @@ def cleanup_on_cuda_error(e: Exception):
             pass
 
 # ----------------------------------------------------------------------------
-# Load Model (Fixed for Nunchaku Quantization Constraints)
+# Load Model (Fixed for AssertionError & Dtype Mismatch)
 # ----------------------------------------------------------------------------
 def load_model_qwen():
     scheduler_config = {
@@ -67,18 +66,24 @@ def load_model_qwen():
 
     log(f"Load transformer: {model_path_nunchaku}")
     
-    # --- CRITICAL FIX 1: Pass torch_dtype inside from_pretrained ---
-    # We cannot use .to(dtype=...) on a quantized model.
-    # Passing torch_dtype here ensures unquantized weights load as FP16.
+    # --- STEP 1: Load Nunchaku Model (Native Dtype) ---
+    # We DO NOT pass torch_dtype here. This allows the loader to read
+    # the BFloat16 weights from the file without triggering the AssertionError.
     transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(
         model_path_nunchaku, 
-        local_files_only=True,
-        torch_dtype=torch.float16
+        local_files_only=True
+        # No torch_dtype arg!
     )
 
+    # --- STEP 2: Manually Cast to Float16 (Fix for 4090 Crash) ---
+    # Now that it's loaded safely, we convert it to Float16.
+    # This prevents the "Half vs BFloat16" mismatch and the "CUBLAS" crash.
+    log("Casting transformer to float16...")
+    transformer = transformer.to(dtype=torch.float16)
+
     log(f"Load pipeline: {model_path_qwen}")
-    # --- CRITICAL FIX 2: Initialize pipeline in FP16, no .to("cuda") ---
-    # This matches the transformer dtype and avoids immediate OOM.
+    # --- STEP 3: Load Pipeline in Float16 ---
+    # Everything now matches: Transformer is FP16, Pipeline is FP16.
     pipeline = QwenImageEditPlusPipeline.from_pretrained(
         model_path_qwen,
         transformer=transformer,
@@ -87,7 +92,7 @@ def load_model_qwen():
         local_files_only=False,
     )
 
-    # --- MEMORY LOGIC: Restore CPU Offload for 24GB cards ---
+    # --- STEP 4: Memory Logic (4090 Optimization) ---
     vram_gb = get_gpu_memory()
     log(f"Detected VRAM: {vram_gb:.1f} GB")
 
@@ -99,7 +104,7 @@ def load_model_qwen():
         pipeline.enable_sequential_cpu_offload()
     else:
         # 4090 logic (High VRAM)
-        # We enable model CPU offload to handle the 4090's 24GB limit safely.
+        # Enable model offload to handle 24GB limit safely
         log("High VRAM mode: enabling model CPU offload")
         pipeline.enable_model_cpu_offload()
 
