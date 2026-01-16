@@ -7,8 +7,8 @@ import gc
 import os
 
 # --- IMPROVEMENT 1: Fix Memory Fragmentation ---
-# This helps when VRAM is nearly full (prevents "fake" OOMs)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Using the updated env var name as per the warning in your logs
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import traceback
 from PIL import Image
@@ -38,7 +38,7 @@ def cleanup_on_cuda_error(e: Exception):
             pass
 
 # ----------------------------------------------------------------------------
-# Load Model (Fixed for 4090 OOM & Dtype Crash)
+# Load Model (Fixed for Nunchaku Quantization Constraints)
 # ----------------------------------------------------------------------------
 def load_model_qwen():
     scheduler_config = {
@@ -67,22 +67,23 @@ def load_model_qwen():
 
     log(f"Load transformer: {model_path_nunchaku}")
     
-    # --- CRITICAL FIX: Force Transformer to Float16 immediately ---
-    # This prevents the "RuntimeError: mat1 and mat2 must have the same dtype"
-    # because the Nunchaku weights default to BFloat16, but our pipeline is Float16.
+    # --- CRITICAL FIX 1: Pass torch_dtype inside from_pretrained ---
+    # We cannot use .to(dtype=...) on a quantized model.
+    # Passing torch_dtype here ensures unquantized weights load as FP16.
     transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(
         model_path_nunchaku, 
-        local_files_only=True
-    ).to(dtype=torch.float16)
+        local_files_only=True,
+        torch_dtype=torch.float16
+    )
 
     log(f"Load pipeline: {model_path_qwen}")
-    # Initialize pipeline. Note: We do NOT call .to("cuda") here.
-    # We let the offload logic handle device placement to avoid instant OOM.
+    # --- CRITICAL FIX 2: Initialize pipeline in FP16, no .to("cuda") ---
+    # This matches the transformer dtype and avoids immediate OOM.
     pipeline = QwenImageEditPlusPipeline.from_pretrained(
         model_path_qwen,
         transformer=transformer,
         scheduler=scheduler,
-        torch_dtype=torch.float16,  # Force pipeline to FP16
+        torch_dtype=torch.float16,
         local_files_only=False,
     )
 
@@ -98,8 +99,7 @@ def load_model_qwen():
         pipeline.enable_sequential_cpu_offload()
     else:
         # 4090 logic (High VRAM)
-        # Even with 24GB, Qwen + activations is too big for full GPU residency.
-        # We enable model CPU offload to swap modules in/out as needed.
+        # We enable model CPU offload to handle the 4090's 24GB limit safely.
         log("High VRAM mode: enabling model CPU offload")
         pipeline.enable_model_cpu_offload()
 
