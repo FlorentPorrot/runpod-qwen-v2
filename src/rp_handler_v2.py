@@ -7,7 +7,7 @@ import gc
 import os
 
 # --- IMPROVEMENT 1: Fix Memory Fragmentation ---
-# This helps when VRAM is nearly full (like your 23.56/23.57 GiB case)
+# This helps when VRAM is nearly full (prevents "fake" OOMs)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import traceback
@@ -38,7 +38,7 @@ def cleanup_on_cuda_error(e: Exception):
             pass
 
 # ----------------------------------------------------------------------------
-# Load Model (Fixed for 4090 OOM)
+# Load Model (Fixed for 4090 OOM & Dtype Crash)
 # ----------------------------------------------------------------------------
 def load_model_qwen():
     scheduler_config = {
@@ -65,24 +65,28 @@ def load_model_qwen():
     )
     model_path_qwen = "Qwen/Qwen-Image-Edit-2509"
 
-log(f"Load transformer: {model_path_nunchaku}")
-    # FORCE .to(torch.float16) here to fix the "Half vs BFloat16" crash
+    log(f"Load transformer: {model_path_nunchaku}")
+    
+    # --- CRITICAL FIX: Force Transformer to Float16 immediately ---
+    # This prevents the "RuntimeError: mat1 and mat2 must have the same dtype"
+    # because the Nunchaku weights default to BFloat16, but our pipeline is Float16.
     transformer = NunchakuQwenImageTransformer2DModel.from_pretrained(
         model_path_nunchaku, 
         local_files_only=True
     ).to(dtype=torch.float16)
 
     log(f"Load pipeline: {model_path_qwen}")
-    # --- FIX 2: Do not call .to("cuda") here. Let offload handle it. ---
+    # Initialize pipeline. Note: We do NOT call .to("cuda") here.
+    # We let the offload logic handle device placement to avoid instant OOM.
     pipeline = QwenImageEditPlusPipeline.from_pretrained(
         model_path_qwen,
         transformer=transformer,
         scheduler=scheduler,
-        torch_dtype=torch.float16,  # Keep FP16 to avoid cuBLAS error
+        torch_dtype=torch.float16,  # Force pipeline to FP16
         local_files_only=False,
     )
 
-    # --- FIX 3: Restore logic to offload on 4090 (High VRAM) ---
+    # --- MEMORY LOGIC: Restore CPU Offload for 24GB cards ---
     vram_gb = get_gpu_memory()
     log(f"Detected VRAM: {vram_gb:.1f} GB")
 
@@ -94,7 +98,8 @@ log(f"Load transformer: {model_path_nunchaku}")
         pipeline.enable_sequential_cpu_offload()
     else:
         # 4090 logic (High VRAM)
-        # We MUST use model_cpu_offload because Qwen is larger than 24GB in operation
+        # Even with 24GB, Qwen + activations is too big for full GPU residency.
+        # We enable model CPU offload to swap modules in/out as needed.
         log("High VRAM mode: enabling model CPU offload")
         pipeline.enable_model_cpu_offload()
 
